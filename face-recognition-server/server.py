@@ -8,7 +8,7 @@ import os.path
 import uuid
 from PIL import Image
 import time
-import StringIO
+from io import StringIO 
 import uuid
 import numpy
 import json
