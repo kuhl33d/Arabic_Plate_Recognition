@@ -8,7 +8,7 @@ Ec = Extract_Characters()
 cp = Car_Plate_Detection()
 
 # Change Path to Picture
-image = cv2.imread('Test/2.jpg')
+image = cv2.imread('Test/1.png')
 
 PlateImg = cp.Detect_Plate(image)
 if PlateImg.all() == None:
@@ -22,9 +22,8 @@ else:
     for i in range(len(characters)):
         word.append(cr.ocr(characters[i]))
     image = cv2.resize(image, (480, 480))
-    cv2.putText(image, str(word), (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (120, 120, 0), 2, cv2.LINE_AA)
-    cv2.imwrite("Output/2.png", image)
-    cv2.imshow("Photo", image)
-    cv2.waitKey(0)
+    
+    
+    print(str(word))
 
 
