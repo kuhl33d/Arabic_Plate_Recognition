@@ -1,73 +1,63 @@
-# from http://bytefish.de/blog/validating_algorithms
-
 import os
 import sys
 import cv2
 import numpy as np
-
 from sklearn.base import BaseEstimator
-from sklearn import cross_validation as cval
+from sklearn import model_selection as ms
 from sklearn.metrics import precision_score
+import logging
 import opencv
 
-def read_images(path, sz=None):
-  """Reads the images in a given folder, resizes images on the fly if size is given.
-
-  Args:
-  path: Path to a folder with subfolders representing the subjects (persons).
-  sz: A tuple with the size Resizes 
-
-  Returns:
-  A list [X,y]
-
-  X: The images, which is a Python list of numpy arrays.
-  y: The corresponding labels (the unique number of the subject, person) in a Python list.
-  """
-  c = 0
-  X,y = [], []
-
-  for dirname, dirnames, filenames in os.walk(path):
-    for subdirname in dirnames:
-      subjectPath = os.path.join(dirname, subdirname)
-      for filename in os.listdir(subjectPath):
-        try:
-          img = cv2.imread(os.path.join(subjectPath, filename), cv2.IMREAD_GRAYSCALE)
-          if sz is not None:
-            img = cv2.resize(img, sz)
-          X.append(np.asarray(img, dtype=np.uint8))
-          y.append(c)
-        # except IOError, (errno, strerror):
-          # print "IOError({0}): {1}".format(errno, strerror)
-        except:
-          print("Unexpected error:" , sys.exc_info()[0])
-          raise
-      c += 1
-  return [X,y]
-
-
 class FaceRecognizer(BaseEstimator):
-  def __init__(self):
-    #self.model = model
-    #self.model = cv2.createFisherFaceRecognizer()
-    self.model = cv2.createEigenFaceRecognizer()
+    def __init__(self):
+        self.model = cv2.face.LBPHFaceRecognizer_create()
 
-  def fit(self, X, y):
-    self.model.train(X, y)
+    def fit(self, X, y):
+        self.model.train(np.array(X), np.array(y))
+        return self
 
-  def predict(self, T):
-    return [self.model.predict(T[i]) for i in range(0, T.shape[0])]
+    def predict(self, T):
+        if T.ndim == 3:  # If T is a list of images
+            return [self.model.predict(T[i])[0] for i in range(T.shape[0])]
+        else:  # If T is a single image
+            return self.model.predict(T)[0]
+
+def validate_model():
+    try:
+        # Load images and labels
+        X, y = opencv.load_images_from_db()
+        if len(X) == 0:
+            logging.error("No images available for validation")
+            return
+            
+        y = np.asarray(y, dtype=np.int32)
+        
+        # Create cross-validation splits
+        cv = ms.StratifiedKFold(n_splits=10, shuffle=True, random_state=42)
+        
+        # Initialize model
+        estimator = FaceRecognizer()
+        
+        # Perform cross-validation
+        precision_scores = ms.cross_val_score(
+            estimator, X, y, 
+            scoring='precision_weighted',
+            cv=cv
+        )
+        
+        # Print results
+        logging.info("Individual precision scores: %s", precision_scores)
+        logging.info("Average precision score: %f", np.mean(precision_scores))
+        
+        return np.mean(precision_scores)
+        
+    except Exception as e:
+        logging.error("Validation error: %s", str(e))
+        return None
 
 if __name__ == "__main__":
-  #[X, y] = read_images(sys.argv[1], (100,100))
-
-  [X, y] = opencv.load_images_from_db()
-  y = np.asarray(y, dtype=np.int32)
-  cv = cval.StratifiedKFold(y, 10)
-
-  estimator = FaceRecognizer()
-
-  precision_scores = cval.cross_val_score(estimator, X, y, score_func=precision_score, cv=cv)
-  print(precision_scores)
-  print(sum(precision_scores)/len(precision_scores))
-
-
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+    validate_model()

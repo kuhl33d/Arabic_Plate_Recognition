@@ -5,164 +5,300 @@ import numpy as np
 import logging
 import shutil
 from peewee import *
+import datetime
 
-MODEL_FILE = "model.mdl"
+# Constants
+MODEL_FILE = "data/models/model.mdl"
+IMAGE_DIR = "data/images"
+DATABASE_FILE = "data/images.db"
+FACE_CASCADE_FILE = "data/haarcascade_frontalface_alt.xml"
 
-def detect(img, cascade):
-  gray = to_grayscale(img)
-  rects = cascade.detectMultiScale(gray, scaleFactor=1.3, minNeighbors=4, minSize=(30, 30), flags = cv2.CASCADE_SCALE_IMAGE)
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
 
-  if len(rects) == 0:
-    return []
-  return rects
+# Database setup
+db = SqliteDatabase(DATABASE_FILE, pragmas={
+    'journal_mode': 'wal',
+    'cache_size': -1024 * 64
+})
 
-def detect_faces(img):
-  cascade = cv2.CascadeClassifier("data/haarcascade_frontalface_alt.xml")
-  return detect(img, cascade)
+class DatabaseConnection:
+    def __enter__(self):
+        if db.is_closed():
+            db.connect()
+        return db
 
-def to_grayscale(img):
-  gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
-  gray = cv2.equalizeHist(gray)
-  return gray
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if not db.is_closed():
+            db.close()
 
-def contains_face(img):
-  return len(detect_faces(img)) > 0
-
-def save(path, img):
-  cv2.imwrite(path, img)
-
-def crop_faces(img, faces):
-  for face in faces:
-    x, y, h, w = [result for result in face]
-    return img[y:y+h,x:x+w]
-
-def load_images(path):
-  images, labels = [], []
-  c = 0
-  print("test " + path)
-  for dirname, dirnames, filenames in os.walk(path):
-    print("test")
-    for subdirname in dirnames:
-      subjectPath = os.path.join(dirname, subdirname)
-      for filename in os.listdir(subjectPath):
-        try:
-          img = cv2.imread(os.path.join(subjectPath, filename), cv2.IMREAD_GRAYSCALE)
-          images.append(np.asarray(img, dtype=np.uint8))
-          labels.append(c)
-        # except IOError as (errno, strerror):
-        #   print("IOError({0}): {1}".format(errno, strerror))
-        except:
-          print("Unexpected error:" , sys.exc_info()[0])
-          raise
-      c += 1
-    return images, labels
-
-def load_images_to_db(path):
-  for dirname, dirnames, filenames in os.walk(path):
-    for subdirname in dirnames:
-      subject_path = os.path.join(dirname, subdirname)
-      label = Label.get_or_create(name=subdirname)
-      label.save()
-      for filename in os.listdir(subject_path):
-        path = os.path.abspath(os.path.join(subject_path, filename))
-        logging.info('saving path %s' % path)
-        image = Image.get_or_create(path=path, label=label)
-        image.save()
-
-def load_images_from_db():
-  images, labels = [],[]
-  for label in Label.select():
-    for image in label.image_set:
-      try:
-        cv_image = cv2.imread(image.path, cv2.IMREAD_GRAYSCALE)
-        cv_image = cv2.resize(cv_image, (100,100))
-        images.append(np.asarray(cv_image, dtype=np.uint8))
-        labels.append(label.id)
-      except IOError as errno:
-        print("IOError({0}): {1}".format(errno))
-      # except IOError, (errno, strerror):
-  return images, np.asarray(labels)
-
-def train():
-  images, labels = load_images_from_db()
-  model = cv2.createFisherFaceRecognizer()
-  #model = cv2.createEigenFaceRecognizer()
-  model.train(images,labels)
-  model.save(MODEL_FILE)
-
-def predict(cv_image):
-  faces = detect_faces(cv_image)
-  result = None
-  if len(faces) > 0:
-    cropped = to_grayscale(crop_faces(cv_image, faces))
-    resized = cv2.resize(cropped, (100,100))
-
-    model = cv2.createFisherFaceRecognizer()
-    #model = cv2.createEigenFaceRecognizer()
-    model.load(MODEL_FILE)
-    prediction = model.predict(resized)
-    result = {
-      'face': {
-        'name': Label.get(Label.id == prediction[0]).name,
-        'distance': prediction[1],
-        'coords': {
-          'x': str(faces[0][0]),
-          'y': str(faces[0][1]),
-          'width': str(faces[0][2]),
-          'height': str(faces[0][3])
-          }
-       }
-    }
-  return result
-
-db = SqliteDatabase("data/images.db")
 class BaseModel(Model):
-  class Meta:
-    database = db
+    class Meta:
+        database = db
 
 class Label(BaseModel):
-  IMAGE_DIR = "data/images"
+    name = CharField(unique=True)
+    created_at = DateTimeField(default=datetime.datetime.now)
 
-  name = CharField()
+    def persist(self):
+        try:
+            path = os.path.join(IMAGE_DIR, self.name)
+            
+            # Clear existing directory if it has 10 or more images
+            if os.path.exists(path) and len(os.listdir(path)) >= 10:
+                shutil.rmtree(path)
 
-  def persist(self):
-    path = os.path.join(self.IMAGE_DIR, self.name)
-    #if directory exists with 10 images
-    #delete it and recreate
-    if os.path.exists(path) and len(os.listdir(path)) >= 10:
-      shutil.rmtree(path)
+            # Create directory if it doesn't exist
+            if not os.path.exists(path):
+                os.makedirs(path)
+                logging.info(f"Created directory for user: {self.name}")
 
-    if not os.path.exists(path):
-      logging.info("Created directory: %s" % self.name)
-      os.makedirs(path)
-
-    Label.get_or_create(name=self.name)
+            return self
+        except Exception as e:
+            logging.error(f"Error persisting label {self.name}: {str(e)}")
+            raise
 
 class Image(BaseModel):
-  IMAGE_DIR = "data/images"
-  path = CharField()
-  label = ForeignKeyField(Label)
+    path = CharField(unique=True)
+    label = ForeignKeyField(Label, backref='images')
+    created_at = DateTimeField(default=datetime.datetime.now)
 
-  def persist(self, cv_image):
-    path = os.path.join(self.IMAGE_DIR, self.label.name)
-    nr_of_images = len(os.listdir(path))
-    if nr_of_images >= 10:
-      return 'Done'
-    faces = detect_faces(cv_image)
-    if len(faces) > 0 and nr_of_images < 10:
-      path += "/%s.jpg" % nr_of_images
-      path = os.path.abspath(path)
-      logging.info("Saving %s" % path)
-      cropped = to_grayscale(crop_faces(cv_image, faces))
-      cv2.imwrite(path, cropped)
-      self.path = path
-      self.save()
+    def persist(self, cv_image):
+        try:
+            path = os.path.join(IMAGE_DIR, self.label.name)
+            nr_of_images = len(os.listdir(path))
+            
+            if nr_of_images >= 10:
+                return 'Done'
 
+            # Detect and process face
+            faces = detect_faces(cv_image)
+            if not faces:
+                return 'No face detected'
+
+            # Process the first detected face
+            face = faces[0]
+            x, y, w, h = map(int, face)
+            
+            # Crop and preprocess face
+            face_img = cv_image[y:y+h, x:x+w]
+            gray_face = to_grayscale(face_img)
+            resized_face = cv2.resize(gray_face, (100, 100))
+
+            # Save the processed face image
+            filename = f"{nr_of_images}.jpg"
+            image_path = os.path.abspath(os.path.join(path, filename))
+            cv2.imwrite(image_path, resized_face)
+
+            # Save to database
+            self.path = image_path
+            self.save()
+
+            logging.info(f"Saved face image {filename} for user {self.label.name}")
+            return 'Success'
+
+        except Exception as e:
+            logging.error(f"Error persisting image: {str(e)}")
+            return None
+
+def initialize_database():
+    """Initialize database and create tables"""
+    try:
+        db.connect()
+        db.create_tables([Label, Image], safe=True)
+        logging.info("Database initialized successfully")
+    except Exception as e:
+        logging.error(f"Database initialization error: {str(e)}")
+        raise
+
+def cleanup_database():
+    """Clean up database connection"""
+    if not db.is_closed():
+        db.close()
+        logging.info("Database connection closed")
+
+def detect_faces(img):
+    """Detect faces in image using Haar Cascade"""
+    try:
+        # Check if cascade file exists
+        if not os.path.exists(FACE_CASCADE_FILE):
+            raise FileNotFoundError(f"Cascade file not found: {FACE_CASCADE_FILE}")
+
+        # Load cascade classifier
+        cascade = cv2.CascadeClassifier(FACE_CASCADE_FILE)
+        
+        # Convert to grayscale
+        gray = to_grayscale(img)
+        
+        # Detect faces
+        faces = cascade.detectMultiScale(
+            gray,
+            scaleFactor=1.1,
+            minNeighbors=5,
+            minSize=(30, 30),
+            flags=cv2.CASCADE_SCALE_IMAGE
+        )
+        
+        return faces.tolist() if len(faces) > 0 else []
+
+    except Exception as e:
+        logging.error(f"Face detection error: {str(e)}")
+        return []
+
+def to_grayscale(img):
+    """Convert image to grayscale if needed"""
+    try:
+        if img is None:
+            raise ValueError("Input image is None")
+            
+        if len(img.shape) == 3:
+            gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+            return cv2.equalizeHist(gray)  # Improve contrast
+        return img
+
+    except Exception as e:
+        logging.error(f"Grayscale conversion error: {str(e)}")
+        return img
+
+def load_images_to_db(path):
+    """Load images from directory into database"""
+    if not os.path.exists(path):
+        logging.warning(f"Directory does not exist: {path}")
+        return
+
+    try:
+        with db.atomic():
+            for dirname, dirnames, filenames in os.walk(path):
+                for subdirname in dirnames:
+                    subject_path = os.path.join(dirname, subdirname)
+                    label, created = Label.get_or_create(name=subdirname)
+                    
+                    if created:
+                        logging.info(f"Created new label: {subdirname}")
+                    
+                    for filename in os.listdir(subject_path):
+                        file_path = os.path.abspath(os.path.join(subject_path, filename))
+                        Image.get_or_create(path=file_path, label=label)
+
+    except Exception as e:
+        logging.error(f"Error loading images to database: {str(e)}")
+        raise
+
+def load_images_from_db():
+    """Load all images from database"""
+    images, labels = [], []
+    try:
+        with DatabaseConnection():
+            for label in Label.select():
+                for image in label.images:
+                    try:
+                        # Load and preprocess image
+                        cv_image = cv2.imread(image.path, cv2.IMREAD_GRAYSCALE)
+                        if cv_image is None:
+                            continue
+                            
+                        cv_image = cv2.resize(cv_image, (100, 100))
+                        images.append(np.asarray(cv_image, dtype=np.uint8))
+                        labels.append(label.id)
+                    except Exception as e:
+                        logging.error(f"Error loading image {image.path}: {str(e)}")
+
+        return images, np.array(labels)
+    except Exception as e:
+        logging.error(f"Error loading images from database: {str(e)}")
+        return [], np.array([])
+
+def train():
+    """Train the face recognition model"""
+    try:
+        # Load images and labels
+        images, labels = load_images_from_db()
+        if len(images) == 0:
+            logging.warning("No images available for training")
+            return False
+
+        # Convert to numpy arrays
+        images_np = np.array(images, dtype=np.uint8)
+        labels_np = np.array(labels, dtype=np.int32)
+
+        # Create and train model
+        model = cv2.face.LBPHFaceRecognizer_create()
+        model.train(images_np, labels_np)
+        
+        # Save model
+        model.write(MODEL_FILE)
+        logging.info("Model trained and saved successfully")
+        return True
+
+    except Exception as e:
+        logging.error(f"Training error: {str(e)}")
+        return False
+
+def predict(cv_image):
+    """Predict face in image"""
+    try:
+        # Detect faces
+        faces = detect_faces(cv_image)
+        if not faces:
+            return None
+
+        # Process first face
+        face = faces[0]
+        x, y, w, h = map(int, face)
+        
+        # Crop and preprocess face
+        face_img = cv_image[y:y+h, x:x+w]
+        gray_face = to_grayscale(face_img)
+        resized_face = cv2.resize(gray_face, (100, 100))
+
+        # Load model and predict
+        model = cv2.face.LBPHFaceRecognizer_create()
+        model.read(MODEL_FILE)
+        
+        label_id, confidence = model.predict(resized_face)
+        
+        # Get label from database
+        with DatabaseConnection():
+            label = Label.get(Label.id == label_id)
+
+        return {
+            'face': {
+                'name': label.name,
+                'confidence': float(confidence),
+                'coords': {
+                    'x': x,
+                    'y': y,
+                    'width': w,
+                    'height': h
+                }
+            }
+        }
+
+    except Exception as e:
+        logging.error(f"Prediction error: {str(e)}")
+        return None
+
+def setup_directories():
+    """Create necessary directories if they don't exist"""
+    try:
+        os.makedirs(IMAGE_DIR, exist_ok=True)
+        os.makedirs(os.path.dirname(MODEL_FILE), exist_ok=True)
+        logging.info("Directories created successfully")
+    except Exception as e:
+        logging.error(f"Error creating directories: {str(e)}")
+        raise
 
 if __name__ == "__main__":
-  load_images_to_db("data/images")
-  #train()
-
-  print('done')
-  #predict()
-  #train()
+    try:
+        # Initialize everything
+        setup_directories()
+        initialize_database()
+        load_images_to_db("data/images")
+        train()
+        logging.info("Initialization completed successfully")
+    except Exception as e:
+        logging.error(f"Initialization error: {str(e)}")
+        sys.exit(1)
