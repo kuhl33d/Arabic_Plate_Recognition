@@ -19,20 +19,12 @@ define("port", default=8888, help="run on the given port", type=int)
 class Application(tornado.web.Application):
     def __init__(self):
         handlers = [
-            (r"/", SetupHarvestHandler),
+            (r"/", MainHandler),
             (r"/harvesting", HarvestHandler),
             (r"/predict", PredictHandler),
             (r"/train", TrainHandler)
         ]
 
-        # settings = dict(
-        #     cookie_secret=os.environ.get('COOKIE_SECRET', "default_secret_key"),
-        #     template_path=os.path.join(os.path.dirname(__file__), "templates"),
-        #     static_path=os.path.join(os.path.dirname(__file__), "static"),
-        #     xsrf_cookies=False,
-        #     autoescape=None,
-        #     debug=True
-        # )
         settings = dict(
             cookie_secret="your_secret_here",
             template_path=os.path.join(os.path.dirname(__file__), "templates"),
@@ -40,9 +32,35 @@ class Application(tornado.web.Application):
             xsrf_cookies=False,
             debug=True
         )
-        tornado.web.Application.__init__(self, handlers, **settings)
+        super().__init__(handlers, **settings)
+
+class MainHandler(tornado.web.RequestHandler):
+    def get(self):
+        self.render("index.html")
+
+    def post(self):
+        try:
+            name = self.get_argument("label", None)
+            if not name or not name.strip():
+                self.set_status(400)
+                self.write({"error": "Label cannot be empty"})
+                return
+
+            logging.info(f"Processing label: {name}")
+            label = opencv.Label.get_or_create(name=name)[0]
+            label.persist()
+            
+            self.set_secure_cookie('label', name)
+            self.write({"status": "success"})
+        except Exception as e:
+            logging.error(f"Error processing label: {str(e)}")
+            self.set_status(500)
+            self.write({"error": str(e)})
 
 class SocketHandler(tornado.websocket.WebSocketHandler):
+    def check_origin(self, origin):
+        return True  # Allow cross-origin requests
+
     def open(self):
         logging.info('New WebSocket connection established')
 
@@ -53,34 +71,16 @@ class SocketHandler(tornado.websocket.WebSocketHandler):
             self.process(cv_image)
         except Exception as e:
             logging.error(f"Error processing message: {str(e)}")
-            self.write_message(json.dumps({"error": "Failed to process image"}))
+            self.write_message(json.dumps({
+                "status": "error",
+                "message": "Failed to process image"
+            }))
 
     def on_close(self):
         logging.info('WebSocket connection closed')
 
     def process(self, cv_image):
         pass
-
-class SetupHarvestHandler(tornado.web.RequestHandler):
-    def get(self):
-        self.render("harvest.html")
-
-    def post(self):
-        try:
-            name = self.get_argument("label", None)
-            if not name or not name.strip():
-                self.write_error(400, message="Label cannot be empty")
-                return
-
-            logging.info(f"Processing label: {name}")
-            label = opencv.Label.get_or_create(name=name)[0]
-            label.persist()
-            
-            self.set_secure_cookie('label', name)
-            self.redirect("/")
-        except Exception as e:
-            logging.error(f"Error in setup harvest: {str(e)}")
-            self.write_error(500)
 
 class HarvestHandler(SocketHandler):
     def process(self, cv_image):
@@ -105,15 +105,20 @@ class HarvestHandler(SocketHandler):
 
             result = opencv.Image(label=label).persist(cv_image)
             
-            self.write_message(json.dumps({
-                'status': 'success',
-                'message': 'Image captured'
-            }))
-
             if result == 'Done':
                 self.write_message(json.dumps({
                     'status': 'complete',
                     'message': 'Training data collection complete'
+                }))
+            elif result == 'Success':
+                self.write_message(json.dumps({
+                    'status': 'success',
+                    'message': 'Image captured'
+                }))
+            else:
+                self.write_message(json.dumps({
+                    'status': 'error',
+                    'message': 'Failed to save image'
                 }))
 
         except Exception as e:
@@ -126,71 +131,122 @@ class HarvestHandler(SocketHandler):
 class TrainHandler(tornado.web.RequestHandler):
     def post(self):
         try:
-            opencv.train()
-            self.write(json.dumps({"status": "success"}))
+            success = opencv.train()
+            if success and opencv.verify_model():
+                self.write(json.dumps({
+                    "status": "success",
+                    "message": "Model trained successfully"
+                }))
+            else:
+                self.set_status(500)
+                self.write(json.dumps({
+                    "status": "error",
+                    "message": "Training or verification failed"
+                }))
         except Exception as e:
             logging.error(f"Error during training: {str(e)}")
-            self.write_error(500)
+            self.set_status(500)
+            self.write(json.dumps({
+                "status": "error",
+                "message": str(e)
+            }))
 
 class PredictHandler(SocketHandler):
     def process(self, cv_image):
         try:
             result = opencv.predict(cv_image)
             if result is not None:
-                self.write_message(json.dumps(result))
+                self.write_message(json.dumps({
+                    "status": "success",
+                    "result": result
+                }))
             else:
                 self.write_message(json.dumps({
-                    "error": "No face detected or prediction failed"
+                    "status": "error",
+                    "message": "No face detected or prediction failed"
                 }))
         except Exception as e:
-            logging.error(f"Prediction processing error: {str(e)}")
+            logging.error(f"Prediction error: {str(e)}")
             self.write_message(json.dumps({
-                "error": "Failed to process image",
-                "details": str(e)
+                "status": "error",
+                "message": str(e)
             }))
 
+def setup_logging():
+    """Configure logging settings"""
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.StreamHandler(),
+            logging.FileHandler('face_recognition.log')
+        ]
+    )
+
 def initialize_application():
-    # Create necessary directories
-    os.makedirs("data/images", exist_ok=True)
-    os.makedirs("data/models", exist_ok=True)
-    
-    # Initialize database
-    opencv.initialize_database()
-    
-    # Clear existing data
-    with opencv.db.atomic():
-        opencv.Image.delete().execute()
-        opencv.Label.delete().execute()
-    
-    # Load initial data
-    opencv.load_images_to_db("data/images")
-    
-    # Train model if there's data
-    if opencv.Image.select().count() > 0:
-        opencv.train()
+    """Initialize application requirements"""
+    try:
+        # Create necessary directories
+        os.makedirs("data/images", exist_ok=True)
+        os.makedirs("data/models", exist_ok=True)
+        
+        # Initialize database
+        opencv.initialize_database()
+        
+        # Check for cascade file
+        cascade_file = "data/haarcascade_frontalface_alt.xml"
+        if not os.path.exists(cascade_file):
+            raise FileNotFoundError(
+                f"Cascade file not found: {cascade_file}. "
+                "Please download it from OpenCV's GitHub repository."
+            )
+        
+        # Clean up invalid images
+        opencv.cleanup_invalid_images()
+        
+        # Load initial data
+        opencv.load_images_to_db("data/images")
+        
+        # Train and verify model if there's data
+        if opencv.Image.select().count() > 0:
+            if not opencv.train() or not opencv.verify_model():
+                raise Exception("Model training or verification failed")
+            
+        logging.info("Application initialized successfully")
+        
+    except Exception as e:
+        logging.error(f"Initialization error: {str(e)}")
+        raise
 
 def main():
     try:
+        # Parse command line arguments
         tornado.options.parse_command_line()
         
-        # Initialize everything
+        # Setup logging
+        setup_logging()
+        
+        # Initialize application
         initialize_application()
         
-        # Start server
+        # Create and start server
         app = Application()
         app.listen(options.port)
+        
         logging.info(f"Server started on port {options.port}")
+        logging.info("Press Ctrl+C to stop the server")
+        
+        # Start IOLoop
         tornado.ioloop.IOLoop.instance().start()
-    
+        
+    except KeyboardInterrupt:
+        logging.info("Server shutdown initiated")
     except Exception as e:
         logging.error(f"Fatal error: {str(e)}")
         raise
     finally:
         opencv.cleanup_database()
+        logging.info("Server shutdown complete")
 
 if __name__ == "__main__":
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-    )
     main()
